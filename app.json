@@ -1,0 +1,11 @@
+{
+  "pages": [
+    "pages/index/index"
+  ],
+  "window": {
+    "navigationBarTitleText": "听懂对方"
+  },
+  "permissions": [
+    "RECORD_AUDIO"
+  ]
+}
