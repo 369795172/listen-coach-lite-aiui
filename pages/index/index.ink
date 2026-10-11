@@ -25,6 +25,17 @@
   【三区】标题逐字固定：对方要点 / 回应方向 / 一条原则
   （与 prompts/coach_system.md 三标记一一对应）。
 
+  【三区排版预算与溢出防护（v0.1.1，修复三区挤下屏）】
+    - .zone-body 20px/30px（v0.1.0 曾 24px/38px）：420px 内容宽（480 −
+      左右 padding 30×2）≈ 21 字/行，prompt 契约上限 80 字 ≈ 4 行 ≈ 120px
+    - 每区 .zone { flex:1; min-height:0; overflow:hidden }：三区 flex 等分
+      不变，任何一区超长只在区内消化，不再把后序区挤出屏
+    - .zone-body 内容包 scroll-view（scroll-y，flex:1 + min-height:0 有界）：
+      超长内容区内心滚动，内容不丢失
+    - 预算（480x640）：状态条 ≈40px + .zones padding 18px + 3 × (title 16 +
+      gap 10 + body ≤105) ≈ 449px ≤ 640px ✓（含 4 行满载 body 120px/区 与
+      fallback 标注 ~20px 的最坏情形 ≈ 532px，仍 ✓）
+
   【事件流】本页只渲染 + 派发：语音唤醒/按键 -> voice.enter()/forceSettle()；
   生命周期卸载/隐藏 -> voice.exit()；ASR/LLM/静默定时器全部在 voice.js，
   状态变化一律经 dispatch() 汇入 state.js transition()，markup/页面脚本
@@ -256,19 +267,26 @@ export default {
     </view>
 
     <!-- 三区面板：listening/thinking 显占位（不上中间分析）；done 显结算 -->
+    <!-- v0.1.1：区体包 scroll-view（区内心滚动），任何一区超长不挤压兄弟区 -->
     <view class="zones" ink:if="{{variant === 'zones'}}">
       <text class="zone-source" ink:if="{{zonesFallback}}">【本地规则】</text>
       <view class="zone">
         <text class="zone-title">对方要点</text>
-        <text class="zone-body">{{zonePoints}}</text>
+        <scroll-view class="zone-scroll" scroll-y="true">
+          <text class="zone-body">{{zonePoints}}</text>
+        </scroll-view>
       </view>
       <view class="zone">
         <text class="zone-title">回应方向</text>
-        <text class="zone-body">{{zoneDirection}}</text>
+        <scroll-view class="zone-scroll" scroll-y="true">
+          <text class="zone-body">{{zoneDirection}}</text>
+        </scroll-view>
       </view>
       <view class="zone">
         <text class="zone-title">一条原则</text>
-        <text class="zone-body">{{zonePrinciple}}</text>
+        <scroll-view class="zone-scroll" scroll-y="true">
+          <text class="zone-body">{{zonePrinciple}}</text>
+        </scroll-view>
       </view>
     </view>
   </view>
@@ -388,12 +406,16 @@ export default {
   padding-top: 18px;
 }
 
+/* v0.1.1 溢出防护：min-height:0 允许 flex 收缩小于内容高，overflow:hidden
+   兜底剪裁——任何一区超长不再把兄弟区挤出屏（flex 等分不变） */
 .zone {
   display: flex;
   flex-direction: column;
   flex: 1;
   gap: 10px;
   justify-content: flex-start;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .zone-title {
@@ -410,9 +432,19 @@ export default {
   padding-bottom: 4px;
 }
 
+/* 区体有界滚动容器：flex:1 + min-height:0 吃满区内剩余高度，
+   内容超高时区内心滚动（scroll-y），内容不丢失 */
+.zone-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* v0.1.1 字号下修（24px/38px → 20px/30px）：420px 内容宽 ≈ 21 字/行，
+   prompt 契约上限 80 字 ≈ 4 行 ≈ 120px，三区 + 状态条稳进 640px */
 .zone-body {
-  font-size: 24px;
-  line-height: 38px;
+  font-size: 20px;
+  line-height: 30px;
   font-weight: 600;
   color: #40FF5E;
 }
