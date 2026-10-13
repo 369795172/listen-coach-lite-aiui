@@ -20,10 +20,13 @@
 // onSettled, systemPrompt, samples, timers, silenceMs })。api 缺省取运行时
 // 全局（模块加载期零副作用）；契约测试注入假 api 即可完整驱动本模块。
 //
-// 静默检测（ASSUMPTION，详见 docs/session-governance.md）：麦克风 ASR 面
-// （SpeechRecognition）无原生静默/分段事件，故按计划 todo 6 的假设路径
-// 自实现：onResult 最终段边界 + SILENCE_MS 无新段定时器触发结算；
-// 按键（forceSettle）为显式第二触发。
+// 静默检测（ASSUMPTION，详见 docs/session-governance.md A1）：麦克风 ASR 面
+// （SpeechRecognition）无原生静默/分段事件，故自实现；时序在 v0.1.1 商店
+// 驳回后重设计：开口前 NO_SPEECH_GRACE_MS 宽限窗到期只续期、绝不结算
+// （点击后的思考时间不受静默惩罚，唯一硬上界 = 10 分钟会话 TIMEOUT）；
+// 首个有效段之后 SILENCE_MS 无新段定时器触发结算；缓冲为空时静默/按键
+// 均不结算不报错（空缓冲守卫，回聆听）。按键（forceSettle）为显式第二
+// 触发。
 //
 // 流式渲染边界：结算触发前（listening）绝不上中间文本；结算触发后
 // （thinking）仅「回应方向」区渐进渲染 promptStreaming 增量；LLM_DONE
@@ -125,8 +128,13 @@ export const DEFAULT_SAMPLES = [
   },
 ];
 
-// 静默结算窗口：最终段后无新段的持续时长（毫秒）
-export const SILENCE_MS = 2000;
+// 静默结算窗口：首个有效段之后，无新段的持续时长（毫秒）
+export const SILENCE_MS = 5000;
+
+// 开口前宽限窗：ASR 启动后到首个有效段之前（毫秒）。到期不结算、只续期
+// ——点击后的开口前思考时间不受静默窗惩罚；唯一硬上界仍是 10 分钟会话
+// 上限（state.js SESSION_LIMIT_MS / 页面 tickClock TIMEOUT）。
+export const NO_SPEECH_GRACE_MS = 10000;
 
 // 计划 todo 6 固定文案：ASR onerror / 空采集 -> 错误态提示
 export const ASR_RETRY_MESSAGE = '没听清，请再说一次';
@@ -153,7 +161,8 @@ function defaultApi() {
 //   opts.onSettled(result)              结算完成（含 fallback/label 数据）通知
 //   opts.systemPrompt / opts.samples    LLM system 提示与兜底样例（缺省=内嵌镜像）
 //   opts.timers           { setTimeout, clearTimeout }（缺省=全局，测试可注入）
-//   opts.silenceMs        静默窗口（缺省 SILENCE_MS）
+//   opts.silenceMs        段后静默窗口（缺省 SILENCE_MS）
+//   opts.noSpeechGraceMs  开口前宽限窗（缺省 NO_SPEECH_GRACE_MS）
 export function createVoiceRuntime(opts) {
   const options = opts && typeof opts === 'object' ? opts : {};
   const noop = () => {};
@@ -173,6 +182,7 @@ export function createVoiceRuntime(opts) {
       clearTimeout: (handle) => clearTimeout(handle),
     },
     silenceMs: typeof options.silenceMs === 'number' ? options.silenceMs : SILENCE_MS,
+    noSpeechGraceMs: typeof options.noSpeechGraceMs === 'number' ? options.noSpeechGraceMs : NO_SPEECH_GRACE_MS,
 
     // voice 活动镜像（非状态机镜像）：listening/thinking=链路活跃，其余=静默
     phase: 'idle',
@@ -191,12 +201,24 @@ export function createVoiceRuntime(opts) {
     return s && Array.isArray(s.segments) ? s.segments : [];
   }
 
-  // —— 静默定时器（ASSUMPTION：onResult 边界 + 2s 无新段）——
+  // —— 静默定时器（A1，v0.1.2 时序：开口前 10s 宽限只续期；段后 5s 无新段触发结算）——
   function clearSilenceTimer() {
     if (runtime.silenceTimer !== null) {
       runtime.timers.clearTimeout(runtime.silenceTimer);
       runtime.silenceTimer = null;
     }
+  }
+
+  function armGraceTimer() {
+    clearSilenceTimer();
+    runtime.silenceTimer = runtime.timers.setTimeout(() => {
+      runtime.silenceTimer = null;
+      if (runtime.phase !== 'listening') {
+        return;
+      }
+      // 宽限到期：不结算、不报错，重开宽限窗继续聆听（10min TIMEOUT 是唯一硬上界）
+      armGraceTimer();
+    }, runtime.noSpeechGraceMs);
   }
 
   function armSilenceTimer() {
@@ -361,6 +383,13 @@ export function createVoiceRuntime(opts) {
     if (runtime.phase !== 'listening') {
       return;
     }
+    // 空缓冲守卫（v0.1.2 驳回修复）：静默窗/按键触发时缓冲仍无任何有效段
+    // -> 不结算、不派错误：保持 listening 并重开开口前宽限窗。真结算只
+    // 发生在缓冲已有 >=1 个有效段之后（治理记录 docs/session-governance.md A1）
+    if (getSegments().length === 0) {
+      armGraceTimer();
+      return;
+    }
     const gen = runtime.generation;
     runtime.phase = 'thinking';
     clearSilenceTimer();
@@ -443,6 +472,7 @@ export function createVoiceRuntime(opts) {
     runtime.dispatch('ENTER'); // 状态机 idle/done/error -> listening
     runtime.phase = 'listening';
     startAsr();
+    armGraceTimer(); // 开口前宽限窗：到期只续期不结算（10min TIMEOUT 是唯一硬上界）
     runtime.llmReady = prepareLlm();
   }
 
