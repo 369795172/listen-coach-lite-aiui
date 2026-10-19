@@ -25,21 +25,33 @@
   【三区】标题逐字固定：对方要点 / 回应方向 / 一条原则
   （与 prompts/coach_system.md 三标记一一对应）。
 
-  【三区排版预算与溢出防护（v0.1.1，修复三区挤下屏）】
-    - .zone-body 20px/30px（v0.1.0 曾 24px/38px）：420px 内容宽（480 −
-      左右 padding 30×2）≈ 21 字/行，prompt 契约上限 80 字 ≈ 4 行 ≈ 120px
+  【三区排版预算与溢出防护（v0.1.3，商店二次驳回整改）】
+    - .zone-body 20px/30px：420px 内容宽（480 − 左右 padding 30×2）≈ 21 字/行
     - 每区 .zone { flex:1; min-height:0; overflow:hidden }：三区 flex 等分
       不变，任何一区超长只在区内消化，不再把后序区挤出屏
-    - .zone-body 内容包 scroll-view（scroll-y，flex:1 + min-height:0 有界）：
-      超长内容区内心滚动，内容不丢失
+    - v0.1.3 起不再依赖滚动：每区内容截断至 ZONE_MAX_CHARS（4 行 × 21 字
+      = 84 字，prompt 契约输出 ≤80 字/区永不截断），超出加「…」续读指示；
+      区体容器为普通 view（原 scroll-view 移除——真机滑动不可用正是本次
+      驳回主因，渲染自持后滚动成为不必要能力）
     - 预算（480x640）：状态条 ≈40px + .zones padding 18px + 3 × (title 16 +
-      gap 10 + body ≤105) ≈ 449px ≤ 640px ✓（含 4 行满载 body 120px/区 与
-      fallback 标注 ~20px 的最坏情形 ≈ 532px，仍 ✓）
+      gap 10 + body ≤120px) + fallback 标注 ~20px ≈ 572px ≤ 640px ✓
+      ——三区 + 状态条常见情形一屏尽收，无需滑动即可读全
 
   【事件流】本页只渲染 + 派发：语音唤醒/按键 -> voice.enter()/forceSettle()；
   生命周期卸载/隐藏 -> voice.exit()；ASR/LLM/静默定时器全部在 voice.js，
   状态变化一律经 dispatch() 汇入 state.js transition()，markup/页面脚本
   零业务判断（todo 6 已接线；会话治理清单见 docs/session-governance.md）。
+
+  【手势区分（v0.1.3，商店二次驳回整改）】镜腿触控板的滑动可能被上报为
+  touch 和/或 key 事件；done 态阅读结果时的滑动绝不能误触新会话：
+    - onTouchStart/onTouchEnd 记录起止坐标与时刻；tap = 时长 < 300ms 且
+      位移 < 10px（任一轴；无坐标时退化为纯时长判定），其余（滑动/长按）
+      只吞事件、不触发任何会话动作（保守取向：存疑不触发）
+    - onKeyDown 在 GESTURE_DEDUPE_MS 窗内已有触控手势判定时以触控为准
+      （tap 已由触控路径路由、滑动在此吞掉）；无触控遥测的纯按键保持
+      原路由（listening=触发结算，其余=开新会话）
+    - 会话动作唯一入口 handleTapActivation()；触控/按键双报的重复触发由
+      voice.js enter()/settleNow() 幂等守卫兜底
 
   【todo 6 增量】thinking 态「回应方向」区可显流式增量（结算触发后，
   仅方向区、其余两区保持占位）；done 态 zones.fallback 时渲染
@@ -58,6 +70,59 @@ function formatClock(ms) {
   const mm = String(minutes).padStart(2, '0');
   const ss = String(seconds).padStart(2, '0');
   return mm + ':' + ss;
+}
+
+// —— v0.1.3 渲染预算：每区显示上限（≈4 行 × 21 字/行 @20px 字号/420px 宽）。
+// prompt 契约输出 ≤80 字/区永不截断；超长（契约违例/流式中间态）截断加
+// 「…」续读指示——三区常见情形一屏尽收，阅读结果不依赖滚动。
+const ZONE_MAX_CHARS = 84;
+
+function clampZone(text) {
+  const s = typeof text === 'string' ? text : '';
+  if (s.length <= ZONE_MAX_CHARS) {
+    return s;
+  }
+  return s.slice(0, ZONE_MAX_CHARS - 1) + '…';
+}
+
+// —— v0.1.3 手势区分（tap vs 滑动，商店二次驳回整改）——
+// 镜腿触控板的滑动可能被上报为 touch 和/或 key 事件；done 态阅读结果时
+// 的滑动绝不能误触新会话。判定规则（保守取向：存疑不触发）：
+//   tap  = 时长 < TAP_MAX_MS 且位移 < TAP_MAX_DELTA（任一轴）
+//   其他 = 滑动/长按，只吞事件，不触发任何会话动作
+const TAP_MAX_MS = 300;
+const TAP_MAX_DELTA = 10;
+// 触控手势判定结果的有效窗：期内到达的 key 事件视为同一手势的重复上报
+const GESTURE_DEDUPE_MS = 600;
+
+// 从 touch 事件对象提取触点坐标（touches/changedTouches/detail/顶层，
+// 多形态兼容——Ink 触控事件形状无公开文档可考，见 session-governance A5）
+function touchPoint(event) {
+  const e = event || {};
+  const candidates = [];
+  if (e.touches && e.touches[0]) {
+    candidates.push(e.touches[0]);
+  }
+  if (e.changedTouches && e.changedTouches[0]) {
+    candidates.push(e.changedTouches[0]);
+  }
+  if (e.detail && typeof e.detail.y === 'number') {
+    candidates.push(e.detail);
+  }
+  candidates.push(e);
+  for (let i = 0; i < candidates.length; i += 1) {
+    const c = candidates[i] || {};
+    if (typeof c.clientX === 'number' && typeof c.clientY === 'number') {
+      return { x: c.clientX, y: c.clientY };
+    }
+    if (typeof c.pageX === 'number' && typeof c.pageY === 'number') {
+      return { x: c.pageX, y: c.pageY };
+    }
+    if (typeof c.x === 'number' && typeof c.y === 'number') {
+      return { x: c.x, y: c.y };
+    }
+  }
+  return null;
 }
 
 export default {
@@ -81,6 +146,10 @@ export default {
     // 结算期流式/兜底渲染状态（实例字段；viewModel 统一映射进 data）
     this.streamDirection = '';
     this.settleFallback = false;
+    // v0.1.3 手势追踪（实例字段，非渲染数据）：touchStart 记起手坐标/时刻；
+    // lastGesture 记最近一次触控判定 {tap, at}，供 onKeyDown 去重
+    this.touchStart = null;
+    this.lastGesture = null;
     // 语音链路运行时：ASR/LLM/静默定时器/结算全部经 voice.js，
     // 状态变化仍经 dispatch() 汇入 state.js（markup/页面零业务判断）
     this.voice = createVoiceRuntime({
@@ -114,13 +183,57 @@ export default {
     this.voiceEnter();
   },
 
-  // 沉浸式按键自接：listening=触发结算；其余态=开新会话
+  // 沉浸式按键自接（v0.1.3：滑动可能被平台上报为 key 事件——近窗内已有
+  // 触控手势判定时以触控为准：tap 已由 onTouchEnd 路由、滑动在此吞掉；
+  // 无触控遥测的纯按键保持原路由：listening=触发结算，其余态=开新会话）
   onKeyDown(event) {
     if (event && typeof event.preventDefault === 'function') {
       try {
         event.preventDefault();
       } catch (_e) {}
     }
+    const gesture = this.lastGesture;
+    if (gesture && Date.now() - gesture.at < GESTURE_DEDUPE_MS) {
+      return; // 同一手势的重复上报：判定权在触控路径
+    }
+    this.handleTapActivation();
+  },
+
+  // 触控起手：记录坐标与时刻（坐标缺失时仅记时刻，判定退化为纯时长）
+  onTouchStart(event) {
+    const point = touchPoint(event);
+    this.touchStart = point
+      ? { x: point.x, y: point.y, at: Date.now() }
+      : { at: Date.now() };
+  },
+
+  // 触控抬手：tap（<300ms 且 <10px 位移）才允许触发会话动作；滑动/长按
+  // 只吞事件。无起手记录（形态异常）时保守不触发。判定结果记入
+  // lastGesture，供后续 key 事件去重（滑动若被重复上报为 key 也一并吞掉）
+  onTouchEnd(event) {
+    const start = this.touchStart;
+    this.touchStart = null;
+    if (!start) {
+      return;
+    }
+    const end = touchPoint(event);
+    const duration = Date.now() - start.at;
+    let tap = duration < TAP_MAX_MS;
+    if (tap && end && typeof start.x === 'number') {
+      const dx = Math.abs(end.x - start.x);
+      const dy = Math.abs(end.y - start.y);
+      tap = Math.max(dx, dy) < TAP_MAX_DELTA;
+    }
+    this.lastGesture = { tap: tap, at: Date.now() };
+    if (tap) {
+      this.handleTapActivation();
+    }
+  },
+
+  // tap 唯一动作面（触控 tap / 无遥测按键共用）：listening=触发结算；
+  // 其余态（idle/done/error）=开新会话。双路径重复触发由 voice.js
+  // enter() 幂等守卫与 settleNow() phase 守卫兜底
+  handleTapActivation() {
     if (this.machine && this.machine.state === 'listening') {
       this.voice.forceSettle();
     } else {
@@ -141,11 +254,12 @@ export default {
     }
   },
 
-  // thinking 态「回应方向」流式渐进渲染：只更新方向区（结算前零中间文本）
+  // thinking 态「回应方向」流式渐进渲染：只更新方向区（结算前零中间文本；
+  // v0.1.3 同样过 clampZone，流式中间态也守渲染预算）
   onDirectionDelta(partialText) {
     if (this.machine && this.machine.state === 'thinking' && typeof partialText === 'string') {
       this.streamDirection = partialText;
-      this.setData({ zoneDirection: partialText || '——' });
+      this.setData({ zoneDirection: partialText ? clampZone(partialText) : '——' });
     }
   },
 
@@ -185,9 +299,10 @@ export default {
       statusLabel: STATUS_LABELS[m.state] || m.state,
       capturing: isCapturing(m.state),
       errorMessage: m.errorMessage,
-      zonePoints: filled ? m.zones.points : '——',
-      zoneDirection: filled ? m.zones.direction : (streaming || '——'),
-      zonePrinciple: filled ? m.zones.principle : '——',
+      // v0.1.3 渲染预算：每区 clampZone 截断 + 「…」续读指示，一屏尽收
+      zonePoints: filled ? clampZone(m.zones.points) : '——',
+      zoneDirection: filled ? clampZone(m.zones.direction) : (streaming ? clampZone(this.streamDirection) : '——'),
+      zonePrinciple: filled ? clampZone(m.zones.principle) : '——',
       zonesFallback: filled ? this.settleFallback === true : false
     };
   },
@@ -267,26 +382,27 @@ export default {
     </view>
 
     <!-- 三区面板：listening/thinking 显占位（不上中间分析）；done 显结算 -->
-    <!-- v0.1.1：区体包 scroll-view（区内心滚动），任何一区超长不挤压兄弟区 -->
+    <!-- v0.1.3：区体为普通 view + 内容截断（ZONE_MAX_CHARS + 「…」），不再
+         依赖滚动（真机 scroll-view 滑动不可用是本次驳回主因之一） -->
     <view class="zones" ink:if="{{variant === 'zones'}}">
       <text class="zone-source" ink:if="{{zonesFallback}}">【本地规则】</text>
       <view class="zone">
         <text class="zone-title">对方要点</text>
-        <scroll-view class="zone-scroll" scroll-y="true">
+        <view class="zone-scroll">
           <text class="zone-body">{{zonePoints}}</text>
-        </scroll-view>
+        </view>
       </view>
       <view class="zone">
         <text class="zone-title">回应方向</text>
-        <scroll-view class="zone-scroll" scroll-y="true">
+        <view class="zone-scroll">
           <text class="zone-body">{{zoneDirection}}</text>
-        </scroll-view>
+        </view>
       </view>
       <view class="zone">
         <text class="zone-title">一条原则</text>
-        <scroll-view class="zone-scroll" scroll-y="true">
+        <view class="zone-scroll">
           <text class="zone-body">{{zonePrinciple}}</text>
-        </scroll-view>
+        </view>
       </view>
     </view>
   </view>
@@ -432,8 +548,9 @@ export default {
   padding-bottom: 4px;
 }
 
-/* 区体有界滚动容器：flex:1 + min-height:0 吃满区内剩余高度，
-   内容超高时区内心滚动（scroll-y），内容不丢失 */
+/* 区体有界容器（v0.1.3 起为普通 view）：flex:1 + min-height:0 吃满区内
+   剩余高度，overflow:hidden 兜底剪裁——内容超长由 clampZone 截断 +
+   「…」续读指示在数据面消化，不依赖滚动 */
 .zone-scroll {
   flex: 1;
   min-height: 0;
