@@ -90,6 +90,40 @@ export function parseZones(llmText) {
   };
 }
 
+// parseZonesProgressive(llmText, opts) -> { zones, markersFound }（v0.1.4）
+//
+// 流式渐进解析：按「已出现」标记的文本序定稿——某区的闭合标记（文本序
+// 下一枚已出现标记）到达即定稿；末位已出现标记的区另需 opts.isFinal=true
+// 且正文非空（流结束收尾）。未定稿区为 null，UI 保持占位不上未验证中间
+// 文本（治理口径：thinking 态只上已定稿区）。区正文为空的定稿区保持
+// null（宁缺勿空）；零标记 => 全 null。永不抛异常。
+export function parseZonesProgressive(llmText, opts) {
+  const options = opts && typeof opts === 'object' ? opts : {};
+  const isFinal = options.isFinal === true;
+  const text = normalizeText(llmText);
+  const zones = { 对方要点: null, 回应方向: null, 一条原则: null };
+  const present = MARKERS
+    .map((marker, i) => ({ marker, zone: ZONE_KEYS[i], idx: text.indexOf(marker) }))
+    .filter((item) => item.idx >= 0)
+    .sort((a, b) => a.idx - b.idx);
+  if (present.length === 0) {
+    return { zones, markersFound: false };
+  }
+  let anyFinalized = false;
+  for (let i = 0; i < present.length; i += 1) {
+    const item = present[i];
+    const bodyStart = item.idx + item.marker.length;
+    const closed = i + 1 < present.length;
+    const bodyEnd = closed ? present[i + 1].idx : text.length;
+    const body = text.slice(bodyStart, bodyEnd).trim();
+    if (body && (closed || isFinal)) {
+      zones[item.zone] = capText(body, SUMMARY_CAP);
+      anyFinalized = true;
+    }
+  }
+  return { zones, markersFound: anyFinalized };
+}
+
 // summarizeSegments(segments) -> string
 //
 // ASR 段落的朴素确定性合并（无 LLM）：滤非字符串、去首尾空白、

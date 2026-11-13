@@ -53,14 +53,27 @@
     - 会话动作唯一入口 handleTapActivation()；触控/按键双报的重复触发由
       voice.js enter()/settleNow() 幂等守卫兜底
 
-  【todo 6 增量】thinking 态「回应方向」区可显流式增量（结算触发后，
-  仅方向区、其余两区保持占位）；done 态 zones.fallback 时渲染
-  【本地规则】来源标注；ASR 错误态 errorMessage 承载「没听清，请再说一次」。
+  【v0.1.4 增量（第 4 次驳回整改：返回慢/无法滑动/arrow 误触）】
+    - 段后静默 5s -> 3s（voice.js SILENCE_MS；宽限与空缓冲守卫独立兜底）
+    - listening 态新增「说完轻触镜腿，立即生成」提示：tap 即结算成为
+      显式主路径，审核员不干等静默窗
+    - thinking 态渐进渲染升级：已定稿区（闭合标记出现）逐区上屏，
+      未定稿区保持占位（parseZonesProgressive 判定，不上未验证文本）
+    - done 态焦点翻区：明确滑动（≥SWIPE_MIN_DELTA）或方向键前向循环
+      聚焦单区（null -> 要点 -> 方向 -> 原则 -> null），聚焦区放宽至
+      FOCUS_MAX_CHARS=160（约 7 行），其余区收成标题行——「无滚动也能
+      读全文」的第三条路；tap 在焦点态先退焦回总览，防阅读中误触重开
+    - 方向键身份路由（keys.js 多形态提取）：done=翻区，其余态只吞，
+      绝不映射为 enter 重开新会话（驳回主因之一）
+
+  【todo 6 增量】done 态 zones.fallback 时渲染【本地规则】来源标注；
+  ASR 错误态 errorMessage 承载「没听清，请再说一次」。
 -->
 
 <script setup>
 import { initialState, transition, STATUS_LABELS, isCapturing, viewVariant, SESSION_LIMIT_MS } from './state.js';
 import { createVoiceRuntime } from './voice.js';
+import { extractKeyIdentity, isArrow, nextFocus } from './keys.js';
 
 // 会话时钟显示格式：毫秒 -> mm:ss
 function formatClock(ms) {
@@ -76,6 +89,13 @@ function formatClock(ms) {
 // prompt 契约输出 ≤80 字/区永不截断；超长（契约违例/流式中间态）截断加
 // 「…」续读指示——三区常见情形一屏尽收，阅读结果不依赖滚动。
 const ZONE_MAX_CHARS = 84;
+// v0.1.4 焦点翻区：done 态滑动/方向键聚焦单区时，该区放宽至 ~7 行，
+// 其余区收成标题行——「无滚动也能读全文」的第三条路（截断 ↔ 滚动之外）。
+const FOCUS_MAX_CHARS = 160;
+const ZONE_COUNT = 3;
+// v0.1.4 滑动判定下限：位移 ≥ 该值且非 tap 判定为滑动（翻区手势）；
+// 10px（TAP_MAX_DELTA）~ 24px 之间的模糊段按「非 tap 即吞」旧规则处理。
+const SWIPE_MIN_DELTA = 24;
 
 function clampZone(text) {
   const s = typeof text === 'string' ? text : '';
@@ -83,6 +103,14 @@ function clampZone(text) {
     return s;
   }
   return s.slice(0, ZONE_MAX_CHARS - 1) + '…';
+}
+
+function clampFocus(text) {
+  const s = typeof text === 'string' ? text : '';
+  if (s.length <= FOCUS_MAX_CHARS) {
+    return s;
+  }
+  return s.slice(0, FOCUS_MAX_CHARS - 1) + '…';
 }
 
 // —— v0.1.3 手势区分（tap vs 滑动，商店二次驳回整改）——
@@ -143,9 +171,12 @@ export default {
     this.machine = initialState();
     this.clockTimer = null;
     this.clockStartedAt = 0;
-    // 结算期流式/兜底渲染状态（实例字段；viewModel 统一映射进 data）
-    this.streamDirection = '';
+    // 结算期流式/兜底渲染状态（实例字段；viewModel 统一映射进 data）：
+    // streamZones = 已定稿区渐进镜像（null = 未定稿保持占位）
+    this.streamZones = { 对方要点: null, 回应方向: null, 一条原则: null };
     this.settleFallback = false;
+    // v0.1.4 焦点翻区：done 态当前聚焦区索引（null = 三区总览）
+    this.zoneFocused = null;
     // v0.1.3 手势追踪（实例字段，非渲染数据）：touchStart 记起手坐标/时刻；
     // lastGesture 记最近一次触控判定 {tap, at}，供 onKeyDown 去重
     this.touchStart = null;
@@ -155,7 +186,7 @@ export default {
     this.voice = createVoiceRuntime({
       dispatch: (event, payload) => this.dispatch(event, payload),
       getState: () => this.machine,
-      onDirectionDelta: (partial) => this.onDirectionDelta(partial),
+      onZonesDelta: (progress) => this.onZonesDelta(progress),
       onSettled: (result) => this.onSettled(result),
     });
     this.setData(this.viewModel(this.machine));
@@ -183,9 +214,10 @@ export default {
     this.voiceEnter();
   },
 
-  // 沉浸式按键自接（v0.1.3：滑动可能被平台上报为 key 事件——近窗内已有
-  // 触控手势判定时以触控为准：tap 已由 onTouchEnd 路由、滑动在此吞掉；
-  // 无触控遥测的纯按键保持原路由：listening=触发结算，其余态=开新会话）
+  // 沉浸式按键自接（v0.1.4：方向键永不重开——第 4 次驳回「arrow 事件被
+  // 定义成 enter 自动开始下一轮」的修复；近窗内已有触控手势判定时以触控
+  // 为准：tap 已由 onTouchEnd 路由、滑动在此吞掉；无触控遥测的纯按键中，
+  // 方向键在 done 态翻区阅读、其余态只吞事件，enter/back 保持原路由）
   onKeyDown(event) {
     if (event && typeof event.preventDefault === 'function') {
       try {
@@ -195,6 +227,13 @@ export default {
     const gesture = this.lastGesture;
     if (gesture && Date.now() - gesture.at < GESTURE_DEDUPE_MS) {
       return; // 同一手势的重复上报：判定权在触控路径
+    }
+    const identity = extractKeyIdentity(event);
+    if (isArrow(identity)) {
+      if (this.machine && this.machine.state === 'done') {
+        this.cycleZoneFocus();
+      }
+      return; // 方向键在 listening/thinking/idle 只吞不触发（绝不重开）
     }
     this.handleTapActivation();
   },
@@ -207,9 +246,10 @@ export default {
       : { at: Date.now() };
   },
 
-  // 触控抬手：tap（<300ms 且 <10px 位移）才允许触发会话动作；滑动/长按
-  // 只吞事件。无起手记录（形态异常）时保守不触发。判定结果记入
-  // lastGesture，供后续 key 事件去重（滑动若被重复上报为 key 也一并吞掉）
+  // 触控抬手：tap（<300ms 且 <10px 位移）才允许触发会话动作；明确滑动
+  // （位移 ≥ SWIPE_MIN_DELTA）在 done 态翻区阅读；其余（模糊段/长按）只吞
+  // 事件。无起手记录（形态异常）时保守不触发。判定结果记入 lastGesture，
+  // 供后续 key 事件去重（滑动若被重复上报为 key 也一并吞掉）
   onTouchEnd(event) {
     const start = this.touchStart;
     this.touchStart = null;
@@ -219,26 +259,45 @@ export default {
     const end = touchPoint(event);
     const duration = Date.now() - start.at;
     let tap = duration < TAP_MAX_MS;
-    if (tap && end && typeof start.x === 'number') {
+    let swipe = false;
+    if (end && typeof start.x === 'number') {
       const dx = Math.abs(end.x - start.x);
       const dy = Math.abs(end.y - start.y);
-      tap = Math.max(dx, dy) < TAP_MAX_DELTA;
+      if (tap) {
+        tap = Math.max(dx, dy) < TAP_MAX_DELTA;
+      }
+      swipe = !tap && Math.max(dx, dy) >= SWIPE_MIN_DELTA;
     }
     this.lastGesture = { tap: tap, at: Date.now() };
     if (tap) {
       this.handleTapActivation();
+    } else if (swipe && this.machine && this.machine.state === 'done') {
+      this.cycleZoneFocus();
     }
   },
 
   // tap 唯一动作面（触控 tap / 无遥测按键共用）：listening=触发结算；
-  // 其余态（idle/done/error）=开新会话。双路径重复触发由 voice.js
+  // done 且焦点翻区激活=先退出焦点回总览（防阅读中误触重开）；其余态
+  // （idle/done(总览)/error）=开新会话。双路径重复触发由 voice.js
   // enter() 幂等守卫与 settleNow() phase 守卫兜底
   handleTapActivation() {
     if (this.machine && this.machine.state === 'listening') {
       this.voice.forceSettle();
+    } else if (this.machine && this.machine.state === 'done' && this.zoneFocused !== null) {
+      this.zoneFocused = null;
+      this.setData(this.viewModel(this.machine));
     } else {
       this.voiceEnter();
     }
+  },
+
+  // v0.1.4 焦点翻区：done 态滑动/方向键前向循环聚焦（null -> 要点 -> 方向 -> 原则 -> null）
+  cycleZoneFocus() {
+    if (!this.machine || this.machine.state !== 'done') {
+      return;
+    }
+    this.zoneFocused = nextFocus(this.zoneFocused, ZONE_COUNT);
+    this.setData(this.viewModel(this.machine));
   },
 
   // 统一的会话进入/退出口（app.js onHide/onError 兜底也走这里）
@@ -254,12 +313,16 @@ export default {
     }
   },
 
-  // thinking 态「回应方向」流式渐进渲染：只更新方向区（结算前零中间文本；
-  // v0.1.3 同样过 clampZone，流式中间态也守渲染预算）
-  onDirectionDelta(partialText) {
-    if (this.machine && this.machine.state === 'thinking' && typeof partialText === 'string') {
-      this.streamDirection = partialText;
-      this.setData({ zoneDirection: partialText ? clampZone(partialText) : '——' });
+  // thinking 态已定稿区渐进渲染（v0.1.4）：只覆盖非 null 的已定稿区，
+  // 未定稿区保持占位；定稿文本同样过 clampZone 守渲染预算
+  onZonesDelta(progress) {
+    if (this.machine && this.machine.state === 'thinking' && progress && typeof progress === 'object') {
+      this.streamZones = {
+        对方要点: typeof progress['对方要点'] === 'string' ? progress['对方要点'] : null,
+        回应方向: typeof progress['回应方向'] === 'string' ? progress['回应方向'] : null,
+        一条原则: typeof progress['一条原则'] === 'string' ? progress['一条原则'] : null,
+      };
+      this.setData(this.viewModel(this.machine));
     }
   },
 
@@ -280,9 +343,10 @@ export default {
     }
     this.machine = next;
     if (event === 'ENTER' || event === 'EXIT') {
-      // 新会话/退出：清空上一轮流式残文与兜底标注
-      this.streamDirection = '';
+      // 新会话/退出：清空上一轮流式残文、兜底标注与焦点翻区
+      this.streamZones = { 对方要点: null, 回应方向: null, 一条原则: null };
       this.settleFallback = false;
+      this.zoneFocused = null;
     }
     this.setData(this.viewModel(next));
     this.syncClock(next);
@@ -292,17 +356,40 @@ export default {
   viewModel(m) {
     const variant = viewVariant(m);
     const filled = variant === 'zones' && m.zones !== null;
-    // thinking 态方向区可显流式增量（结算触发后；其余 listening 态恒占位）
-    const streaming = m.state === 'thinking' && this.streamDirection;
+    const streaming = m.state === 'thinking';
+    const focus = m.state === 'done' && this.zoneFocused !== null ? this.zoneFocused : null;
+    const capFor = (idx) => (focus !== null && focus === idx ? clampFocus : clampZone);
+    const collapsed = (idx) => focus !== null && focus !== idx;
+    const titleClass = (idx) => {
+      let cls = 'zone-title';
+      if (focus !== null) {
+        cls += idx === focus ? ' zone-focus' : ' zone-dim';
+      }
+      return cls;
+    };
+    const zoneText = (idx, finalText, streamText) => {
+      if (filled) {
+        return collapsed(idx) ? '' : capFor(idx)(finalText);
+      }
+      if (streaming && streamText) {
+        return collapsed(idx) ? '' : clampZone(streamText);
+      }
+      return '——';
+    };
     return {
       variant: variant,
       statusLabel: STATUS_LABELS[m.state] || m.state,
       capturing: isCapturing(m.state),
       errorMessage: m.errorMessage,
-      // v0.1.3 渲染预算：每区 clampZone 截断 + 「…」续读指示，一屏尽收
-      zonePoints: filled ? clampZone(m.zones.points) : '——',
-      zoneDirection: filled ? clampZone(m.zones.direction) : (streaming ? clampZone(this.streamDirection) : '——'),
-      zonePrinciple: filled ? clampZone(m.zones.principle) : '——',
+      // v0.1.3 渲染预算：每区 clampZone 截断 + 「…」续读指示，一屏尽收；
+      // v0.1.4 焦点翻区：聚焦区放宽 FOCUS_MAX_CHARS，其余区收成标题行
+      zonePoints: zoneText(0, m.zones ? m.zones.points : '', this.streamZones['对方要点']),
+      zoneDirection: zoneText(1, m.zones ? m.zones.direction : '', this.streamZones['回应方向']),
+      zonePrinciple: zoneText(2, m.zones ? m.zones.principle : '', this.streamZones['一条原则']),
+      titleClass0: titleClass(0),
+      titleClass1: titleClass(1),
+      titleClass2: titleClass(2),
+      listeningHint: m.state === 'listening',
       zonesFallback: filled ? this.settleFallback === true : false
     };
   },
@@ -381,29 +468,31 @@ export default {
       <text class="hint">按键开始下一轮</text>
     </view>
 
-    <!-- 三区面板：listening/thinking 显占位（不上中间分析）；done 显结算 -->
+    <!-- 三区面板：listening/thinking 显占位（不上未定稿中间文本）；done 显结算 -->
     <!-- v0.1.3：区体为普通 view + 内容截断（ZONE_MAX_CHARS + 「…」），不再
-         依赖滚动（真机 scroll-view 滑动不可用是本次驳回主因之一） -->
+         依赖滚动；v0.1.4：done 态滑动/方向键焦点翻区（聚焦区放宽、其余
+         收成标题行）+ listening 态轻触提示（tap 即结算的主路径入口） -->
     <view class="zones" ink:if="{{variant === 'zones'}}">
       <text class="zone-source" ink:if="{{zonesFallback}}">【本地规则】</text>
       <view class="zone">
-        <text class="zone-title">对方要点</text>
+        <text class="{{titleClass0}}">对方要点</text>
         <view class="zone-scroll">
           <text class="zone-body">{{zonePoints}}</text>
         </view>
       </view>
       <view class="zone">
-        <text class="zone-title">回应方向</text>
+        <text class="{{titleClass1}}">回应方向</text>
         <view class="zone-scroll">
           <text class="zone-body">{{zoneDirection}}</text>
         </view>
       </view>
       <view class="zone">
-        <text class="zone-title">一条原则</text>
+        <text class="{{titleClass2}}">一条原则</text>
         <view class="zone-scroll">
           <text class="zone-body">{{zonePrinciple}}</text>
         </view>
       </view>
+      <text class="listen-hint" ink:if="{{listeningHint}}">说完轻触镜腿，立即生成</text>
     </view>
   </view>
 </page>
@@ -538,6 +627,25 @@ export default {
   font-size: 16px;
   color: rgba(64, 255, 94, 0.55);
   letter-spacing: 4px;
+}
+
+/* v0.1.4 焦点翻区：聚焦区标题点亮，其余区标题压暗（正文已收空） */
+.zone-focus {
+  color: #40FF5E;
+}
+
+.zone-dim {
+  color: rgba(64, 255, 94, 0.22);
+}
+
+/* v0.1.4 listening 态轻触提示：tap 即结算的主路径入口（第 4 次驳回
+   「返回时间太慢」的感知层整改——审核员无需干等静默窗） */
+.listen-hint {
+  font-size: 16px;
+  color: rgba(64, 255, 94, 0.5);
+  letter-spacing: 2px;
+  text-align: center;
+  padding-top: 6px;
 }
 
 /* 兜底卡来源标注：LLM 不可用时的本地规则结算（zones.fallback 时渲染） */

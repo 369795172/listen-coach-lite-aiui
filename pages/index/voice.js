@@ -16,7 +16,7 @@
 //     onresult（event.results[i][0].transcript，isFinal=最终段）、
 //     onerror、onend 回调，start() / stop() / abort()
 //
-// 可注入性：createVoiceRuntime({ api, dispatch, getState, onDirectionDelta,
+// 可注入性：createVoiceRuntime({ api, dispatch, getState, onZonesDelta,
 // onSettled, systemPrompt, samples, timers, silenceMs })。api 缺省取运行时
 // 全局（模块加载期零副作用）；契约测试注入假 api 即可完整驱动本模块。
 //
@@ -28,9 +28,10 @@
 // 均不结算不报错（空缓冲守卫，回聆听）。按键（forceSettle）为显式第二
 // 触发。
 //
-// 流式渲染边界：结算触发前（listening）绝不上中间文本；结算触发后
-// （thinking）仅「回应方向」区渐进渲染 promptStreaming 增量；LLM_DONE
-// 后三区归位。全部经 onDirectionDelta / onSettled 回调交页面渲染。
+// 流式渲染边界（v0.1.4 修订）：结算触发前（listening）绝不上中间文本；
+// 结算触发后（thinking）只上「已定稿区」——经 parseZonesProgressive 判定，
+// 该区闭合标记已出现（正文归属确定、无标记残段），逐区渐进渲染；
+// LLM_DONE 后三区归位。全部经 onZonesDelta / onSettled 回调交页面渲染。
 //
 // 会话代次（generation，todo 10 / F2 MAJOR-2）：release() 单调换代并置
 // disposed；prepareLlm / settleNow 在每个 await 恢复点校验代次，不符即
@@ -38,7 +39,7 @@
 // 迟到 create 的会话泄漏、TIMEOUT/EXIT 后旧协程向新会话渗 LLM_FAIL/
 // LLM_DONE/旧增量、exit 快速重入双 prepareLlm 的 last-writer-wins 泄漏。
 
-import { settle, buildFallbackCard, pickClosestSample, summarizeSegments } from './settlement.js';
+import { settle, buildFallbackCard, pickClosestSample, summarizeSegments, parseZonesProgressive } from './settlement.js';
 
 // —— 内嵌资产镜像（与 prompts/ 源文件的逐字一致性由
 // tests/settlement_contract.mjs 以 fs 读源文件做字节/深相等断言守护；
@@ -128,8 +129,11 @@ export const DEFAULT_SAMPLES = [
   },
 ];
 
-// 静默结算窗口：首个有效段之后，无新段的持续时长（毫秒）
-export const SILENCE_MS = 5000;
+// 段后静默结算窗口：首个有效段之后，无新段的持续时长（毫秒）。
+// v0.1.4：5s -> 3s（第 4 次驳回「返回时间太慢」整改）：开口前宽限 +
+// 空缓冲守卫已独立防住 v1.0.0 的过早结算故障面，段间静默可收紧；
+// 即时收口主路径 = UI 提示「轻触结束并生成」（tap 即结算，v0.1.2 已有）。
+export const SILENCE_MS = 3000;
 
 // 开口前宽限窗：ASR 启动后到首个有效段之前（毫秒）。到期不结算、只续期
 // ——点击后的开口前思考时间不受静默窗惩罚；唯一硬上界仍是 10 分钟会话
@@ -157,8 +161,9 @@ function defaultApi() {
 //   opts.api              { SpeechRecognition, LanguageModel }（缺省=运行时全局）
 //   opts.dispatch(event, payload)  状态机汇入口（页面 this.dispatch）
 //   opts.getState()       -> 状态机快照（取 segments 缓冲）
-//   opts.onDirectionDelta(partialText)  thinking 态「回应方向」流式渐进渲染
-//   opts.onSettled(result)              结算完成（含 fallback/label 数据）通知
+//   opts.onZonesDelta(progress)     thinking 态已定稿区渐进渲染
+//                                   progress = {对方要点|null, 回应方向|null, 一条原则|null}
+//   opts.onSettled(result)          结算完成（含 fallback/label 数据）通知
 //   opts.systemPrompt / opts.samples    LLM system 提示与兜底样例（缺省=内嵌镜像）
 //   opts.timers           { setTimeout, clearTimeout }（缺省=全局，测试可注入）
 //   opts.silenceMs        段后静默窗口（缺省 SILENCE_MS）
@@ -171,7 +176,7 @@ export function createVoiceRuntime(opts) {
     api: options.api || defaultApi(),
     dispatch: typeof options.dispatch === 'function' ? options.dispatch : noop,
     getState: typeof options.getState === 'function' ? options.getState : () => null,
-    onDirectionDelta: typeof options.onDirectionDelta === 'function' ? options.onDirectionDelta : noop,
+    onZonesDelta: typeof options.onZonesDelta === 'function' ? options.onZonesDelta : noop,
     onSettled: typeof options.onSettled === 'function' ? options.onSettled : noop,
     systemPrompt: typeof options.systemPrompt === 'string' && options.systemPrompt
       ? options.systemPrompt
@@ -432,8 +437,8 @@ export function createVoiceRuntime(opts) {
         }
         if (chunk.value !== undefined) {
           full += String(chunk.value);
-          // 能走到这里 = 本代次仍持有 thinking；仅「回应方向」区渐进渲染
-          runtime.onDirectionDelta(full);
+          // 已定稿区渐进上屏（未定稿区为 null，UI 保持占位）
+          runtime.onZonesDelta(parseZonesProgressive(full, { isFinal: false }).zones);
         }
       }
       finish(settle(segments, full));

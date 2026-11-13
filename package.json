@@ -1,6 +1,6 @@
 {
   "name": "listen-coach-lite",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "description": "听懂对方——戴上就能听懂对方在说什么，给你回应方向",
   "main": "app.js",
   "type": "module",
